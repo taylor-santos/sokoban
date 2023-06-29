@@ -9,6 +9,8 @@
 
 use cgmath::{Matrix3, Matrix4, Point3, Rad, Vector3};
 use std::{sync::Arc, time::Instant};
+use std::f32::consts::{FRAC_PI_4};
+use std::io::Cursor;
 use tobj;
 use vulkano::{
     buffer::{
@@ -22,25 +24,23 @@ use vulkano::{
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, PersistentDescriptorSet, WriteDescriptorSet,
     },
-    device::{
-        physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, DeviceOwned,
-        QueueCreateInfo, QueueFlags,
-    },
+    device::{physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags},
     format::Format,
-    image::{view::ImageView, AttachmentImage, ImageAccess, ImageUsage, SwapchainImage},
+    image::{ImageDimensions, ImmutableImage, MipmapsCount, view::ImageView, AttachmentImage, ImageAccess, ImageUsage, SwapchainImage},
     instance::{Instance, InstanceCreateInfo},
     memory::allocator::{AllocationCreateInfo, MemoryUsage, StandardMemoryAllocator},
     pipeline::{
         graphics::{
             depth_stencil::DepthStencilState,
             input_assembly::InputAssemblyState,
+            rasterization::{CullMode, RasterizationState},
             vertex_input::Vertex,
             viewport::{Viewport, ViewportState},
         },
         GraphicsPipeline, Pipeline, PipelineBindPoint,
     },
     render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
-    shader::ShaderModule,
+    sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
     swapchain::{
         acquire_next_image, AcquireError, Swapchain, SwapchainCreateInfo, SwapchainCreationError,
         SwapchainPresentInfo,
@@ -48,6 +48,7 @@ use vulkano::{
     sync::{self, FlushError, GpuFuture},
     VulkanLibrary,
 };
+use image::{io::Reader, GenericImageView};
 use vulkano_win::VkSurfaceBuild;
 use winit::{
     event::{Event, WindowEvent},
@@ -77,44 +78,28 @@ pub struct Texcoord {
 }
 
 fn main() {
-    let (models, materials) =
-        tobj::load_obj(
-            "models/bunny.obj",
-            &tobj::LoadOptions::default()
-        )
-        .expect("Failed to OBJ load file");
-
-    let model = models.first().expect("OBJ contained no models");
-
-    let _materials = materials.expect("Failed to load MTL file");
-
-    let library = VulkanLibrary::new().unwrap();
-
     // The first step of any Vulkan program is to create an instance.
-    //
-    // When we create an instance, we have to pass a list of extensions that we want to enable.
-    //
-    // All the window-drawing functionalities are part of non-core extensions that we need to
-    // enable manually. To do so, we ask the `vulkano_win` crate for the list of extensions
-    // required to draw to a window.
-    let required_extensions = vulkano_win::required_extensions(&library);
+    let instance = {
+        let library = VulkanLibrary::new().unwrap();
+        // When we create an instance, we have to pass a list of extensions that we want to enable.
+        //
+        // All the window-drawing functionalities are part of non-core extensions that we need to
+        // enable manually. To do so, we ask the `vulkano_win` crate for the list of extensions
+        // required to draw to a window.
+        let required_extensions = vulkano_win::required_extensions(&library);
+        Instance::new(
+            library,
+            InstanceCreateInfo {
+                enabled_extensions: required_extensions,
+                // Enable enumerating devices that use non-conformant Vulkan implementations. (e.g.
+                // MoltenVK)
+                enumerate_portability: true,
+                ..Default::default()
+            },
+        ).unwrap()
+    };
 
-    // Now creating the instance.
-    let instance = Instance::new(
-        library,
-        InstanceCreateInfo {
-            enabled_extensions: required_extensions,
-            // Enable enumerating devices that use non-conformant Vulkan implementations. (e.g.
-            // MoltenVK)
-            enumerate_portability: true,
-            ..Default::default()
-        },
-    )
-        .unwrap();
-
-    // The objective of this example is to draw a teapot on a window. To do so, we first need to
-    // create the window.
-    //
+    // Next, we need to create the window.
     // This is done by creating a `WindowBuilder` from the `winit` crate, then calling the
     // `build_vk_surface` method provided by the `VkSurfaceBuild` trait from `vulkano_win`. If you
     // ever get an error about `build_vk_surface` being undefined in one of your projects, this
@@ -124,6 +109,7 @@ fn main() {
     // winit window and a cross-platform Vulkan surface that represents the surface of the window.
     let event_loop = EventLoop::new();
     let surface = WindowBuilder::new()
+        .with_title("Sokoban Game")
         .build_vk_surface(&event_loop, instance.clone())
         .unwrap();
 
@@ -291,8 +277,28 @@ fn main() {
             .unwrap()
     };
 
-    let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
+    let (models, _materials) =  tobj::load_obj(
+        "models/StanfordBunny.obj",
+        &tobj::LoadOptions {
+            // Some models define an independent set of triangle indices for positions, normals, and
+            // texcoords. Vulkan expects each triangle to be defined by a single triplet of indices,
+            // referring to the same locations in the positions, normals, and texcoords arrays. By
+            // enablng the `single_index` flag, the mesh is automatically converted to the correct
+            // form.
+            single_index: true,
+            ..Default::default()
+        }
+    ).expect("Failed to load OBJ file");
+
+    let model = models.first().expect("OBJ contained no models");
+
+    let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+    let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone());
+    let command_buffer_allocator =
+        StandardCommandBufferAllocator::new(device.clone(), Default::default());
+
+    // The following three buffers will contain the positions, normals, and texcoords from our mesh.
     let vertex_buffer = Buffer::from_iter(
         &memory_allocator,
         BufferCreateInfo {
@@ -332,6 +338,10 @@ fn main() {
         model.mesh.texcoords.iter().cloned(),
     )
         .unwrap();
+
+    // This buffer stores the indices defining each triangle of our mesh. One triplet of indices
+    // from this buffer defines the three positions, three normals, and three texcoords that make up
+    // one triangle.
     let index_buffer = Buffer::from_iter(
         &memory_allocator,
         BufferCreateInfo {
@@ -354,6 +364,7 @@ fn main() {
         },
     );
 
+    // Load the vertex and fragment shaders, respectively
     let vs = vs::load(device.clone()).unwrap();
     let fs = fs::load(device.clone()).unwrap();
 
@@ -401,260 +412,324 @@ fn main() {
     )
     .unwrap();
 
-    let (mut pipeline, mut framebuffers) =
-        window_size_dependent_setup(&memory_allocator, &vs, &fs, &images, render_pass.clone());
-    let mut recreate_swapchain = false;
+    let pipeline = GraphicsPipeline::start()
+        .vertex_input_state([
+            Position::per_vertex(),
+            Normal::per_vertex(),
+            Texcoord::per_vertex()
+        ])
+        .vertex_shader(vs.entry_point("main").unwrap(), ())
+        .input_assembly_state(InputAssemblyState::new())
+        .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
+        .fragment_shader(fs.entry_point("main").unwrap(), ())
+        .depth_stencil_state(DepthStencilState::simple_depth_test())
+        .rasterization_state(RasterizationState::new().cull_mode(CullMode::Front))
+        .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
+        .build(device.clone())
+        .unwrap();
 
-    let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
+    let (image_data, image_dimensions) = {
+        let png_bytes = include_bytes!("../textures/StanfordBunnyTerracotta.jpg").to_vec();
+        let cursor = Cursor::new(png_bytes);
+        let reader = Reader::new(cursor)
+            .with_guessed_format()
+            .expect("Unable to read image file");
+        let img = reader
+            .decode()
+            .expect("Unablet to decode PNG");
+
+        let (width, height) = img.dimensions();
+
+        let dimensions = ImageDimensions::Dim2d {
+            width,
+            height,
+            array_layers: 1,
+        };
+
+        (img.into_rgba8(), dimensions)
+    };
+
+    let mut viewport = Viewport {
+        origin: [0.0, 0.0],
+        dimensions: [0.0, 0.0],
+        depth_range: 0.0..1.0,
+    };
+
+    let mut framebuffers = window_size_dependent_setup(
+        &memory_allocator,
+        &images,
+        render_pass.clone(),
+        &mut viewport,
+    );
+
+    let sampler = Sampler::new(
+        device.clone(),
+        SamplerCreateInfo {
+            mag_filter: Filter::Linear,
+            min_filter: Filter::Linear,
+            address_mode: [SamplerAddressMode::Repeat; 3],
+            ..Default::default()
+        },
+    )
+        .unwrap();
+
+    let mut texture: Option<Arc<ImageView<_>>> = None;
+
+    let mut recreate_swapchain = false;
+    let mut previous_frame_end = Some(Box::new(sync::now(device.clone())) as Box<dyn GpuFuture>);
     let rotation_start = Instant::now();
 
-    let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone());
-    let command_buffer_allocator =
-        StandardCommandBufferAllocator::new(device.clone(), Default::default());
-
-    event_loop.run(move |event, _, control_flow| {
-        match event {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                *control_flow = ControlFlow::Exit;
+    event_loop.run(move |event, _, control_flow| match event {
+        Event::WindowEvent {
+            event: WindowEvent::CloseRequested,
+            ..
+        } => {
+            *control_flow = ControlFlow::Exit;
+        }
+        Event::WindowEvent {
+            event: WindowEvent::Resized(_),
+            ..
+        } => {
+            recreate_swapchain = true;
+        }
+        Event::RedrawEventsCleared => {
+            // Do not draw the frame when the screen dimensions are zero. On Windows, this can
+            // occur when minimizing the application.
+            let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
+            let dimensions = window.inner_size();
+            if dimensions.width == 0 || dimensions.height == 0 {
+                return;
             }
-            Event::WindowEvent {
-                event: WindowEvent::Resized(_),
-                ..
-            } => {
-                recreate_swapchain = true;
-            }
-            Event::RedrawEventsCleared => {
-                // Do not draw the frame when the screen dimensions are zero. On Windows, this can
-                // occur when minimizing the application.
-                let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
-                let dimensions = window.inner_size();
-                if dimensions.width == 0 || dimensions.height == 0 {
-                    return;
-                }
 
-                // It is important to call this function from time to time, otherwise resources
-                // will keep accumulating and you will eventually reach an out of memory error.
-                // Calling this function polls various fences in order to determine what the GPU
-                // has already processed, and frees the resources that are no longer needed.
-                previous_frame_end.as_mut().unwrap().cleanup_finished();
+            // It is important to call this function from time to time, otherwise resources
+            // will keep accumulating and you will eventually reach an out of memory error.
+            // Calling this function polls various fences in order to determine what the GPU
+            // has already processed, and frees the resources that are no longer needed.
+            previous_frame_end
+                .as_mut()
+                .take()
+                .unwrap()
+                .cleanup_finished();
 
-                // Whenever the window resizes we need to recreate everything dependent on the
-                // window size. In this example that includes the swapchain, the framebuffers and
-                // the dynamic state viewport.
-                if recreate_swapchain {
-                    // Use the new dimensions of the window.
-
-                    let (new_swapchain, new_images) =
-                        match swapchain.recreate(SwapchainCreateInfo {
-                            image_extent: dimensions.into(),
-                            ..swapchain.create_info()
-                        }) {
-                            Ok(r) => r,
-                            // This error tends to happen when the user is manually resizing the
-                            // window. Simply restarting the loop is the easiest way to fix this
-                            // issue.
-                            Err(SwapchainCreationError::ImageExtentNotSupported { .. }) => return,
-                            Err(e) => panic!("failed to recreate swapchain: {e}"),
-                        };
-
-                    swapchain = new_swapchain;
-
-                    // Because framebuffers contains a reference to the old swapchain, we need to
-                    // recreate framebuffers as well.
-                    let (new_pipeline, new_framebuffers) = window_size_dependent_setup(
-                        &memory_allocator,
-                        &vs,
-                        &fs,
-                        &new_images,
-                        render_pass.clone(),
-                    );
-                    pipeline = new_pipeline;
-                    framebuffers = new_framebuffers;
-                    recreate_swapchain = false;
-                }
-
-                let uniform_buffer_subbuffer = {
-                    let elapsed = rotation_start.elapsed();
-                    let rotation =
-                        elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000_000.0;
-                    let rotation = Matrix3::from_angle_y(Rad(rotation as f32));
-
-                    // note: this teapot was meant for OpenGL where the origin is at the lower left
-                    //       instead the origin is at the upper left in Vulkan, so we reverse the Y axis
-                    let aspect_ratio =
-                        swapchain.image_extent()[0] as f32 / swapchain.image_extent()[1] as f32;
-                    let proj = cgmath::perspective(
-                        Rad(std::f32::consts::FRAC_PI_2),
-                        aspect_ratio,
-                        0.01,
-                        100.0,
-                    );
-                    let view = Matrix4::look_at_rh(
-                        Point3::new(0.3, 1.0, 2.0),
-                        Point3::new(0.0, 0.5, 0.0),
-                        Vector3::new(0.0, -1.0, 0.0),
-                    );
-                    let scale = Matrix4::from_scale(0.01);
-
-                    let uniform_data = vs::Data {
-                        world: Matrix4::from(rotation).into(),
-                        view: (view * scale).into(),
-                        proj: proj.into(),
-                    };
-
-                    let subbuffer = uniform_buffer.allocate_sized().unwrap();
-                    *subbuffer.write().unwrap() = uniform_data;
-
-                    subbuffer
+            // Whenever the window resizes we need to recreate everything dependent on the
+            // window size. In this example that includes the swapchain, the framebuffers and
+            // the dynamic state viewport.
+            if recreate_swapchain {
+                // Use the new dimensions of the window.
+                println!("recreate_swapchain");
+                let (new_swapchain, new_images) = match swapchain.recreate(SwapchainCreateInfo {
+                    image_extent: dimensions.into(),
+                    ..swapchain.create_info()
+                }) {
+                    Ok(r) => r,
+                    // This error tends to happen when the user is manually resizing the
+                    // window. Simply restarting the loop is the easiest way to fix this
+                    // issue.
+                    Err(SwapchainCreationError::ImageExtentNotSupported { .. }) => return,
+                    Err(e) => panic!("failed to recreate swapchain: {e}"),
                 };
 
-                let layout = pipeline.layout().set_layouts().get(0).unwrap();
-                let set = PersistentDescriptorSet::new(
-                    &descriptor_set_allocator,
-                    layout.clone(),
-                    [WriteDescriptorSet::buffer(0, uniform_buffer_subbuffer)],
-                )
-                .unwrap();
+                swapchain = new_swapchain;
+                framebuffers = window_size_dependent_setup(
+                    &memory_allocator,
+                    &new_images,
+                    render_pass.clone(),
+                    &mut viewport,
+                );
+                recreate_swapchain = false;
+            }
 
-                let (image_index, suboptimal, acquire_future) =
-                    match acquire_next_image(swapchain.clone(), None) {
-                        Ok(r) => r,
-                        Err(AcquireError::OutOfDate) => {
-                            recreate_swapchain = true;
-                            return;
-                        }
-                        Err(e) => panic!("failed to acquire next image: {e}"),
-                    };
-
-                // `acquire_next_image` can be successful, but suboptimal. This means that the
-                // swapchain image will still work, but it may not display correctly. With some
-                // drivers this can be when the window resizes, but it may not cause the swapchain
-                // to become out of date.
-                if suboptimal {
-                    recreate_swapchain = true;
-                }
-
-                // In order to draw, we have to build a *command buffer*. The command buffer object
-                // holds the list of commands that are going to be executed.
-                //
-                // Building a command buffer is an expensive operation (usually a few hundred
-                // microseconds), but it is known to be a hot path in the driver and is expected to
-                // be optimized.
-                //
-                // Note that we have to pass a queue family when we create the command buffer. The
-                // command buffer will only be executable on that given queue family.
-                let mut builder = AutoCommandBufferBuilder::primary(
-                    &command_buffer_allocator,
-                    queue.queue_family_index(),
-                    CommandBufferUsage::OneTimeSubmit,
-                )
-                .unwrap();
-
-                builder
-                    // Before we can draw, we have to *enter a render pass*.
-                    .begin_render_pass(
-                        RenderPassBeginInfo {
-                            // A list of values to clear the attachments with. This list contains
-                            // one item for each attachment in the render pass. In this case, there
-                            // are two attachments, color and depth, and we clear them with a blue
-                            // color and 1.0, respectively.
-                            // Only attachments that have `LoadOp::Clear` are provided with clear
-                            // values, any others should use `ClearValue::None` as the clear value.
-                            clear_values: vec![
-                                Some([0.0, 0.0, 1.0, 1.0].into()),
-                                Some(1f32.into()),
-                            ],
-                            ..RenderPassBeginInfo::framebuffer(
-                                framebuffers[image_index as usize].clone(),
-                            )
-                        },
-                        // The contents of the first (and only) subpass. This can be either
-                        // `Inline` or `SecondaryCommandBuffers`. The latter is a bit more advanced
-                        // and is not covered here.
-                        SubpassContents::Inline,
-                    )
-                    .unwrap()
-                    .bind_pipeline_graphics(pipeline.clone())
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        pipeline.layout().clone(),
-                        0,
-                        set,
-                    )
-                    .bind_vertex_buffers(0, (
-                        vertex_buffer.clone(),
-                        normals_buffer.clone(),
-                        texcoord_buffer.clone()
-                    ))
-                    .bind_index_buffer(index_buffer.clone())
-                    .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
-                    .unwrap()
-                    // We leave the render pass. Note that if we had multiple subpasses we could
-                    // have called `next_subpass` to jump to the next subpass.
-                    .end_render_pass()
-                    .unwrap();
-
-                // Finish building the command buffer by calling `build`.
-                let command_buffer = builder.build().unwrap();
-
-                let future = previous_frame_end
-                    .take()
-                    .unwrap()
-                    .join(acquire_future)
-                    .then_execute(queue.clone(), command_buffer)
-                    .unwrap()
-                    // The color output is now expected to contain our teapot. But in order to
-                    // show it on the screen, we have to *present* the image by calling
-                    // `then_swapchain_present`.
-                    //
-                    // This function does not actually present the image immediately. Instead it
-                    // submits a present command at the end of the queue. This means that it will
-                    // only be presented once the GPU has finished executing the command buffer
-                    // that draws the teapot.
-                    .then_swapchain_present(
-                        queue.clone(),
-                        SwapchainPresentInfo::swapchain_image_index(swapchain.clone(), image_index),
-                    )
-                    .then_signal_fence_and_flush();
-
-                match future {
-                    Ok(future) => {
-                        previous_frame_end = Some(future.boxed());
-                    }
-                    Err(FlushError::OutOfDate) => {
+            let (image_index, suboptimal, acquire_future) =
+                match acquire_next_image(swapchain.clone(), None) {
+                    Ok(r) => r,
+                    Err(AcquireError::OutOfDate) => {
                         recreate_swapchain = true;
-                        previous_frame_end = Some(sync::now(device.clone()).boxed());
+                        return;
                     }
-                    Err(e) => {
-                        println!("failed to flush future: {e}");
-                        previous_frame_end = Some(sync::now(device.clone()).boxed());
-                    }
+                    Err(e) => panic!("failed to acquire next image: {e}"),
+                };
+
+            // `acquire_next_image` can be successful, but suboptimal. This means that the
+            // swapchain image will still work, but it may not display correctly. With some
+            // drivers this can be when the window resizes, but it may not cause the swapchain
+            // to become out of date.
+            if suboptimal {
+                recreate_swapchain = true;
+            }
+
+            // In order to draw, we have to build a *command buffer*. The command buffer object
+            // holds the list of commands that are going to be executed.
+            //
+            // Building a command buffer is an expensive operation (usually a few hundred
+            // microseconds), but it is known to be a hot path in the driver and is expected to
+            // be optimized.
+            //
+            // Note that we have to pass a queue family when we create the command buffer. The
+            // command buffer will only be executable on that given queue family.
+            let mut builder = AutoCommandBufferBuilder::primary(
+                &command_buffer_allocator,
+                queue.queue_family_index(),
+                CommandBufferUsage::OneTimeSubmit,
+            )
+            .unwrap();
+
+            let texture = texture.get_or_insert_with(|| {
+                let image = ImmutableImage::from_iter(
+                    &memory_allocator,
+                    image_data.iter().cloned(),
+                    image_dimensions,
+                    MipmapsCount::One,
+                    Format::R8G8B8A8_UNORM,
+                    &mut builder,
+                )
+                    .unwrap();
+                ImageView::new_default(image).unwrap()
+            });
+
+            let clear_values = vec![Some([0.0, 0.68, 1.0, 1.0].into()), Some(1.0.into())];
+
+            let uniform_subbuffer = {
+                let elapsed = rotation_start.elapsed();
+                let rotation =
+                    elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000_000.0;
+                let rotation = Matrix3::from_angle_y(Rad(rotation as f32));
+
+                let aspect_ratio =
+                    swapchain.image_extent()[0] as f32 / swapchain.image_extent()[1] as f32;
+                let proj = cgmath::perspective(
+                    Rad(FRAC_PI_4),
+                    aspect_ratio,
+                    0.01,
+                    100.0,
+                );
+                let view = Matrix4::look_at_rh(
+                    Point3::new(0.0, 0.5, 2.0),
+                    Point3::new(0.0, 0.5, 0.0),
+                    Vector3::new(0.0, -1.0, 0.0),
+                );
+                let scale = Matrix4::from_scale(5.0);
+
+                let uniform_data = vs::Data {
+                    world: Matrix4::from(rotation).into(),
+                    view: (view * scale).into(),
+                    proj: proj.into(),
+                };
+
+                let subbuffer = uniform_buffer.allocate_sized().unwrap();
+                *subbuffer.write().unwrap() = uniform_data;
+
+                subbuffer
+            };
+
+            let layout = pipeline.layout().set_layouts().get(0).unwrap();
+            let set = PersistentDescriptorSet::new(
+                &descriptor_set_allocator,
+                layout.clone(),
+                [
+                    WriteDescriptorSet::buffer(0, uniform_subbuffer.clone()),
+                    WriteDescriptorSet::image_view_sampler(1, texture.clone(), sampler.clone()),
+                ],
+            )
+                .unwrap();
+
+            builder
+                // Before we can draw, we have to *enter a render pass*.
+                .begin_render_pass(
+                    RenderPassBeginInfo {
+                        // A list of values to clear the attachments with. This list contains
+                        // one item for each attachment in the render pass. In this case, there
+                        // are two attachments, color and depth, and we clear them with a blue
+                        // color and 1.0, respectively.
+                        // Only attachments that have `LoadOp::Clear` are provided with clear
+                        // values, any others should use `ClearValue::None` as the clear value.
+                        clear_values,
+                        ..RenderPassBeginInfo::framebuffer(
+                            framebuffers[image_index as usize].clone(),
+                        )
+                    },
+                    // The contents of the first (and only) subpass. This can be either
+                    // `Inline` or `SecondaryCommandBuffers`. The latter is a bit more advanced
+                    // and is not covered here.
+                    SubpassContents::Inline,
+                )
+                .unwrap()
+                .set_viewport(0, [viewport.clone()])
+                .bind_pipeline_graphics(pipeline.clone())
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    pipeline.layout().clone(),
+                    0,
+                    set,
+                )
+                .bind_vertex_buffers(0, (
+                    vertex_buffer.clone(),
+                    normals_buffer.clone(),
+                    texcoord_buffer.clone()
+                ))
+                .bind_index_buffer(index_buffer.clone())
+                .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
+                .unwrap()
+                // We leave the render pass. Note that if we had multiple subpasses we could
+                // have called `next_subpass` to jump to the next subpass.
+                .end_render_pass()
+                .unwrap();
+
+            // Finish building the command buffer by calling `build`.
+            let command_buffer = builder.build().unwrap();
+
+            let future = previous_frame_end
+                .take()
+                .unwrap()
+                .join(acquire_future)
+                .then_execute(queue.clone(), command_buffer)
+                .unwrap()
+                // The color output is now expected to contain our rendered scene. But in order to
+                // show it on the screen, we have to *present* the image by calling
+                // `then_swapchain_present`.
+                //
+                // This function does not actually present the image immediately. Instead it
+                // submits a present command at the end of the queue. This means that it will
+                // only be presented once the GPU has finished executing the command buffer
+                // that draws the scene.
+                .then_swapchain_present(
+                    queue.clone(),
+                    SwapchainPresentInfo::swapchain_image_index(swapchain.clone(), image_index),
+                )
+                .then_signal_fence_and_flush();
+
+            match future {
+                Ok(future) => {
+                    previous_frame_end = Some(future.boxed());
+                }
+                Err(FlushError::OutOfDate) => {
+                    recreate_swapchain = true;
+                    previous_frame_end = Some(sync::now(device.clone()).boxed());
+                }
+                Err(e) => {
+                    println!("failed to flush future: {e}");
+                    previous_frame_end = Some(sync::now(device.clone()).boxed());
                 }
             }
-            _ => (),
         }
+        _ => (),
     });
 }
 
 /// This function is called once during initialization, then again whenever the window is resized.
 fn window_size_dependent_setup(
-    memory_allocator: &StandardMemoryAllocator,
-    vs: &ShaderModule,
-    fs: &ShaderModule,
+    allocator: &StandardMemoryAllocator,
     images: &[Arc<SwapchainImage>],
     render_pass: Arc<RenderPass>,
-) -> (Arc<GraphicsPipeline>, Vec<Arc<Framebuffer>>) {
+    viewport: &mut Viewport,
+) -> Vec<Arc<Framebuffer>> {
     let dimensions = images[0].dimensions().width_height();
-
+    viewport.dimensions = [dimensions[0] as f32, dimensions[1] as f32];
     let depth_buffer = ImageView::new_default(
-        AttachmentImage::transient(memory_allocator, dimensions, Format::D16_UNORM).unwrap(),
+        AttachmentImage::transient(allocator, dimensions, Format::D16_UNORM).unwrap(),
     )
-    .unwrap();
+        .unwrap();
 
-    let framebuffers = images
+    images
         .iter()
         .map(|image| {
             let view = ImageView::new_default(image.clone()).unwrap();
@@ -665,36 +740,9 @@ fn window_size_dependent_setup(
                     ..Default::default()
                 },
             )
-            .unwrap()
+                .unwrap()
         })
-        .collect::<Vec<_>>();
-
-    // In the triangle example we use a dynamic viewport, as its a simple example. However in the
-    // teapot example, we recreate the pipelines with a hardcoded viewport instead. This allows the
-    // driver to optimize things, at the cost of slower window resizes.
-    // https://computergraphics.stackexchange.com/questions/5742/vulkan-best-way-of-updating-pipeline-viewport
-    let pipeline = GraphicsPipeline::start()
-        .vertex_input_state([
-            Position::per_vertex(),
-            Normal::per_vertex(),
-            Texcoord::per_vertex()
-        ])
-        .vertex_shader(vs.entry_point("main").unwrap(), ())
-        .input_assembly_state(InputAssemblyState::new())
-        .viewport_state(ViewportState::viewport_fixed_scissor_irrelevant([
-            Viewport {
-                origin: [0.0, 0.0],
-                dimensions: [dimensions[0] as f32, dimensions[1] as f32],
-                depth_range: 0.0..1.0,
-            },
-        ]))
-        .fragment_shader(fs.entry_point("main").unwrap(), ())
-        .depth_stencil_state(DepthStencilState::simple_depth_test())
-        .render_pass(Subpass::from(render_pass, 0).unwrap())
-        .build(memory_allocator.device().clone())
-        .unwrap();
-
-    (pipeline, framebuffers)
+        .collect::<Vec<_>>()
 }
 
 mod vs {
