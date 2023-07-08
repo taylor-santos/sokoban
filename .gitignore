@@ -1,6 +1,4 @@
 debug/
 target/
 
-Cargo.lock
-
 .idea

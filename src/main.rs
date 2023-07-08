@@ -7,15 +7,14 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-use cgmath::{Matrix3, Matrix4, Point3, Rad, Vector3};
 use std::{sync::Arc, time::Instant};
-use std::f32::consts::{FRAC_PI_4};
-use std::io::Cursor;
-use tobj;
+use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+
+use cgmath::{Matrix4, Point3, Rad};
 use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
-        Buffer, BufferContents, BufferCreateInfo, BufferUsage,
+        BufferContents, BufferUsage,
     },
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
@@ -24,11 +23,11 @@ use vulkano::{
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, PersistentDescriptorSet, WriteDescriptorSet,
     },
-    device::{physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags},
+    device::{Device, DeviceCreateInfo, DeviceExtensions, physical::PhysicalDeviceType, QueueCreateInfo, QueueFlags},
     format::Format,
-    image::{ImageDimensions, ImmutableImage, MipmapsCount, view::ImageView, AttachmentImage, ImageAccess, ImageUsage, SwapchainImage},
+    image::{AttachmentImage, ImageAccess, ImageUsage, ImmutableImage, MipmapsCount, SwapchainImage, view::ImageView},
     instance::{Instance, InstanceCreateInfo},
-    memory::allocator::{AllocationCreateInfo, MemoryUsage, StandardMemoryAllocator},
+    memory::allocator::StandardMemoryAllocator,
     pipeline::{
         graphics::{
             depth_stencil::DepthStencilState,
@@ -48,13 +47,22 @@ use vulkano::{
     sync::{self, FlushError, GpuFuture},
     VulkanLibrary,
 };
-use image::{io::Reader, GenericImageView};
+use vulkano::command_buffer::PrimaryCommandBufferAbstract;
 use vulkano_win::VkSurfaceBuild;
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
+use winit::event::{DeviceEvent, ElementState, VirtualKeyCode};
+use winit::window::CursorGrabMode;
+
+use camera::FirstPersonCamera;
+use mesh::Mesh;
+
+mod mesh;
+mod texture;
+mod camera;
 
 #[derive(BufferContents, Vertex)]
 #[repr(C)]
@@ -76,6 +84,7 @@ pub struct Texcoord {
     #[format(R32G32_SFLOAT)]
     texcoord: [f32; 2],
 }
+
 
 fn main() {
     // The first step of any Vulkan program is to create an instance.
@@ -111,6 +120,10 @@ fn main() {
     let surface = WindowBuilder::new()
         .with_title("Sokoban Game")
         .build_vk_surface(&event_loop, instance.clone())
+        .unwrap();
+    let window = surface.object()
+        .unwrap()
+        .downcast_ref::<Window>()
         .unwrap();
 
     // Choose device extensions that we're going to use. In order to present images to a surface,
@@ -235,7 +248,6 @@ fn main() {
                 .unwrap()[0]
                 .0,
         );
-        let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
 
         // Please take a look at the docs for the meaning of the parameters we didn't mention.
         Swapchain::new(
@@ -277,86 +289,11 @@ fn main() {
             .unwrap()
     };
 
-
-    let (models, _materials) =  tobj::load_obj(
-        "models/StanfordBunny.obj",
-        &tobj::LoadOptions {
-            // Some models define an independent set of triangle indices for positions, normals, and
-            // texcoords. Vulkan expects each triangle to be defined by a single triplet of indices,
-            // referring to the same locations in the positions, normals, and texcoords arrays. By
-            // enablng the `single_index` flag, the mesh is automatically converted to the correct
-            // form.
-            single_index: true,
-            ..Default::default()
-        }
-    ).expect("Failed to load OBJ file");
-
-    let model = models.first().expect("OBJ contained no models");
-
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
     let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone());
     let command_buffer_allocator =
         StandardCommandBufferAllocator::new(device.clone(), Default::default());
-
-    // The following three buffers will contain the positions, normals, and texcoords from our mesh.
-    let vertex_buffer = Buffer::from_iter(
-        &memory_allocator,
-        BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            usage: MemoryUsage::Upload,
-            ..Default::default()
-        },
-        model.mesh.positions.iter().cloned(),
-    )
-        .unwrap();
-    let normals_buffer = Buffer::from_iter(
-        &memory_allocator,
-        BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            usage: MemoryUsage::Upload,
-            ..Default::default()
-        },
-        model.mesh.normals.iter().cloned(),
-    )
-        .unwrap();
-    let texcoord_buffer = Buffer::from_iter(
-        &memory_allocator,
-        BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            usage: MemoryUsage::Upload,
-            ..Default::default()
-        },
-        model.mesh.texcoords.iter().cloned(),
-    )
-        .unwrap();
-
-    // This buffer stores the indices defining each triangle of our mesh. One triplet of indices
-    // from this buffer defines the three positions, three normals, and three texcoords that make up
-    // one triangle.
-    let index_buffer = Buffer::from_iter(
-        &memory_allocator,
-        BufferCreateInfo {
-            usage: BufferUsage::INDEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            usage: MemoryUsage::Upload,
-            ..Default::default()
-        },
-        model.mesh.indices.iter().cloned(),
-    )
-        .unwrap();
-
-    let uniform_buffer = SubbufferAllocator::new(
+    let subbuffer_allocator = SubbufferAllocator::new(
         memory_allocator.clone(),
         SubbufferAllocatorCreateInfo {
             buffer_usage: BufferUsage::UNIFORM_BUFFER,
@@ -410,7 +347,7 @@ fn main() {
             depth_stencil: {depth},
         },
     )
-    .unwrap();
+        .unwrap();
 
     let pipeline = GraphicsPipeline::start()
         .vertex_input_state([
@@ -423,31 +360,11 @@ fn main() {
         .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
         .fragment_shader(fs.entry_point("main").unwrap(), ())
         .depth_stencil_state(DepthStencilState::simple_depth_test())
-        .rasterization_state(RasterizationState::new().cull_mode(CullMode::Front))
+        // A rasterization_state is necessary to render textures
+        .rasterization_state(RasterizationState::new().cull_mode(CullMode::Back))
         .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
         .build(device.clone())
         .unwrap();
-
-    let (image_data, image_dimensions) = {
-        let png_bytes = include_bytes!("../textures/StanfordBunnyTerracotta.jpg").to_vec();
-        let cursor = Cursor::new(png_bytes);
-        let reader = Reader::new(cursor)
-            .with_guessed_format()
-            .expect("Unable to read image file");
-        let img = reader
-            .decode()
-            .expect("Unablet to decode PNG");
-
-        let (width, height) = img.dimensions();
-
-        let dimensions = ImageDimensions::Dim2d {
-            width,
-            height,
-            array_layers: 1,
-        };
-
-        (img.into_rgba8(), dimensions)
-    };
 
     let mut viewport = Viewport {
         origin: [0.0, 0.0],
@@ -473,24 +390,100 @@ fn main() {
     )
         .unwrap();
 
-    let mut texture: Option<Arc<ImageView<_>>> = None;
+    window.set_cursor_grab(CursorGrabMode::Confined)
+        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked))
+        .unwrap();
+    window.set_cursor_visible(false);
+
+    let (
+        meshes,
+        materials,
+        textures,
+        objects,
+    ) = Mesh::from_gltf("models/sponza.gltf", &memory_allocator)
+        .unwrap();
+
+    let image_buffers = {
+        let mut builder = AutoCommandBufferBuilder::primary(
+            &command_buffer_allocator,
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        ).unwrap();
+        let image_buffer_time = Instant::now();
+        let images = textures.into_iter().map(|texture| {
+            let image = ImmutableImage::from_iter(
+                &memory_allocator,
+                texture.data.into_raw().into_iter(),
+                texture.dimensions,
+                MipmapsCount::One,
+                Format::R8G8B8A8_UNORM,
+                &mut builder,
+            ).unwrap();
+            ImageView::new_default(image)
+                .unwrap()
+        })
+            .collect::<Vec<_>>();
+
+        dbg!(image_buffer_time.elapsed());
+
+        builder.build()
+            .unwrap()
+            .execute(queue.clone())
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None)
+            .unwrap();
+
+        images
+    };
+
+    let mut camera = FirstPersonCamera::new();
+    camera.position = Point3::new(0.3, 0.05, 0.0);
+    camera.yaw = Rad(FRAC_PI_2);
 
     let mut recreate_swapchain = false;
     let mut previous_frame_end = Some(Box::new(sync::now(device.clone())) as Box<dyn GpuFuture>);
-    let rotation_start = Instant::now();
+    let mut last_instant = Instant::now();
+    let mut forward = false;
+    let mut right = false;
+    let mut backward = false;
+    let mut left = false;
 
     event_loop.run(move |event, _, control_flow| match event {
-        Event::WindowEvent {
-            event: WindowEvent::CloseRequested,
-            ..
-        } => {
-            *control_flow = ControlFlow::Exit;
+        Event::WindowEvent { event, .. } => match event {
+            WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+            WindowEvent::Resized(_) => recreate_swapchain = true,
+            WindowEvent::KeyboardInput { input, .. } => {
+                let pressed = input.state == ElementState::Pressed;
+
+                match input.virtual_keycode {
+                    Some(VirtualKeyCode::W) => forward = pressed,
+                    Some(VirtualKeyCode::A) => left = pressed,
+                    Some(VirtualKeyCode::S) => backward = pressed,
+                    Some(VirtualKeyCode::D) => right = pressed,
+                    _ => {}
+                }
+            }
+            _ => {}
         }
-        Event::WindowEvent {
-            event: WindowEvent::Resized(_),
-            ..
-        } => {
-            recreate_swapchain = true;
+        Event::DeviceEvent { event, .. } => match event {
+            DeviceEvent::MouseMotion { delta } => {
+                camera.rotate(delta.0 as f32, delta.1 as f32);
+            }
+            _ => {}
+        }
+        Event::MainEventsCleared => {
+            let now = Instant::now();
+            let delta_time = now.duration_since(last_instant);
+            last_instant = now;
+
+            let delta_t = delta_time.as_secs_f32();
+
+            if forward { camera.move_forward(delta_t); }
+            if left { camera.move_left(delta_t); }
+            if right { camera.move_right(delta_t); }
+            if backward { camera.move_backward(delta_t); }
         }
         Event::RedrawEventsCleared => {
             // Do not draw the frame when the screen dimensions are zero. On Windows, this can
@@ -516,7 +509,6 @@ fn main() {
             // the dynamic state viewport.
             if recreate_swapchain {
                 // Use the new dimensions of the window.
-                println!("recreate_swapchain");
                 let (new_swapchain, new_images) = match swapchain.recreate(SwapchainCreateInfo {
                     image_extent: dimensions.into(),
                     ..swapchain.create_info()
@@ -571,66 +563,63 @@ fn main() {
                 queue.queue_family_index(),
                 CommandBufferUsage::OneTimeSubmit,
             )
-            .unwrap();
-
-            let texture = texture.get_or_insert_with(|| {
-                let image = ImmutableImage::from_iter(
-                    &memory_allocator,
-                    image_data.iter().cloned(),
-                    image_dimensions,
-                    MipmapsCount::One,
-                    Format::R8G8B8A8_UNORM,
-                    &mut builder,
-                )
-                    .unwrap();
-                ImageView::new_default(image).unwrap()
-            });
+                .unwrap();
 
             let clear_values = vec![Some([0.0, 0.68, 1.0, 1.0].into()), Some(1.0.into())];
 
             let uniform_subbuffer = {
-                let elapsed = rotation_start.elapsed();
-                let rotation =
-                    elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000_000.0;
-                let rotation = Matrix3::from_angle_y(Rad(rotation as f32));
+                let proj = {
+                    let aspect_ratio = swapchain.image_extent()[0] as f32
+                        / swapchain.image_extent()[1] as f32;
+                    let near = 0.02;
+                    let far = 10000.0;
 
-                let aspect_ratio =
-                    swapchain.image_extent()[0] as f32 / swapchain.image_extent()[1] as f32;
-                let proj = cgmath::perspective(
-                    Rad(FRAC_PI_4),
-                    aspect_ratio,
-                    0.01,
-                    100.0,
-                );
-                let view = Matrix4::look_at_rh(
-                    Point3::new(0.0, 0.5, 2.0),
-                    Point3::new(0.0, 0.5, 0.0),
-                    Vector3::new(0.0, -1.0, 0.0),
-                );
-                let scale = Matrix4::from_scale(5.0);
+                    let proj = cgmath::perspective(
+                        Rad(FRAC_PI_4),
+                        aspect_ratio,
+                        near,
+                        far,
+                    );
+                    // Vulkan clip space has inverted Y and half Z, compared with OpenGL.
+                    // A corrective transformation is needed to make an OpenGL perspective matrix
+                    // work properly. See here for more info:
+                    // https://matthewwellings.com/blog/the-new-vulkan-coordinate-system/
+                    let correction = Matrix4::<f32>::new(
+                        1.0, 0.0, 0.0, 0.0,
+                        0.0, -1.0, 0.0, 0.0,
+                        0.0, 0.0, 0.5, 0.0,
+                        0.0, 0.0, 0.5, 1.0,
+                    );
+
+                    correction * proj
+                };
+                let view = camera.get_view_matrix();
+
+                let scale = Matrix4::from_scale(0.05);
+
 
                 let uniform_data = vs::Data {
-                    world: Matrix4::from(rotation).into(),
-                    view: (view * scale).into(),
+                    world: (scale).into(),
+                    view: view.into(),
                     proj: proj.into(),
                 };
 
-                let subbuffer = uniform_buffer.allocate_sized().unwrap();
+                let subbuffer = subbuffer_allocator.allocate_sized().unwrap();
                 *subbuffer.write().unwrap() = uniform_data;
 
                 subbuffer
             };
 
-            let layout = pipeline.layout().set_layouts().get(0).unwrap();
-            let set = PersistentDescriptorSet::new(
+            let layout0 = pipeline.layout().set_layouts().get(0).unwrap();
+            let layout1 = pipeline.layout().set_layouts().get(1).unwrap();
+            let layout2 = pipeline.layout().set_layouts().get(2).unwrap();
+            let set0 = PersistentDescriptorSet::new(
                 &descriptor_set_allocator,
-                layout.clone(),
+                layout0.clone(),
                 [
-                    WriteDescriptorSet::buffer(0, uniform_subbuffer.clone()),
-                    WriteDescriptorSet::image_view_sampler(1, texture.clone(), sampler.clone()),
+                    WriteDescriptorSet::buffer(0, uniform_subbuffer),
                 ],
-            )
-                .unwrap();
+            ).unwrap();
 
             builder
                 // Before we can draw, we have to *enter a render pass*.
@@ -654,21 +643,59 @@ fn main() {
                 )
                 .unwrap()
                 .set_viewport(0, [viewport.clone()])
-                .bind_pipeline_graphics(pipeline.clone())
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    pipeline.layout().clone(),
-                    0,
-                    set,
-                )
-                .bind_vertex_buffers(0, (
-                    vertex_buffer.clone(),
-                    normals_buffer.clone(),
-                    texcoord_buffer.clone()
-                ))
-                .bind_index_buffer(index_buffer.clone())
-                .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
-                .unwrap()
+                .bind_pipeline_graphics(pipeline.clone());
+
+            for object in &objects {
+                let transform = object.transform;
+
+                let object_subbuffer = {
+                    let subbuffer = subbuffer_allocator.allocate_sized().unwrap();
+                    let data = vs::Object {
+                        transform,
+                    };
+                    *subbuffer.write().unwrap() = data;
+                    subbuffer
+                };
+
+                for mesh in &meshes[object.mesh_id] {
+                    let mat_id = mesh.material.unwrap();
+                    let tex_id = materials[mat_id].base_color_texture.unwrap();
+                    let texture = &image_buffers[tex_id];
+
+                    let set2 = PersistentDescriptorSet::new(
+                        &descriptor_set_allocator,
+                        layout2.clone(),
+                        [
+                            WriteDescriptorSet::buffer(0, object_subbuffer.clone()),
+                        ],
+                    ).expect("Failed to create descriptor set");
+                    let set1 = PersistentDescriptorSet::new(
+                        &descriptor_set_allocator,
+                        layout1.clone(),
+                        [
+                            WriteDescriptorSet::image_view_sampler(0, texture.clone(), sampler.clone()),
+                        ],
+                    ).expect("Failed to create descriptor set");
+
+                    builder
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            pipeline.layout().clone(),
+                            0,
+                            (set0.clone(), set1, set2),
+                        )
+                        .bind_vertex_buffers(0, (
+                            mesh.vertices.clone(),
+                            mesh.normals.clone().unwrap(),
+                            mesh.texcoords.clone().unwrap(),
+                        ))
+                        .bind_index_buffer(mesh.indices.clone())
+                        .draw_indexed(mesh.indices.len() as u32, 1, 0, 0, 0)
+                        .unwrap();
+                }
+            }
+
+            builder
                 // We leave the render pass. Note that if we had multiple subpasses we could
                 // have called `next_subpass` to jump to the next subpass.
                 .end_render_pass()
