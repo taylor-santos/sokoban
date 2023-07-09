@@ -9,6 +9,7 @@
 
 use std::{sync::Arc, time::Instant};
 use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+use std::process;
 
 use cgmath::{Matrix4, Point3, Rad};
 use vulkano::{
@@ -54,7 +55,7 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
-use winit::event::{DeviceEvent, ElementState, VirtualKeyCode};
+use winit::event::{DeviceEvent, ElementState, VirtualKeyCode, MouseButton};
 use winit::window::CursorGrabMode;
 
 use camera::FirstPersonCamera;
@@ -390,10 +391,7 @@ fn main() {
     )
         .unwrap();
 
-    window.set_cursor_grab(CursorGrabMode::Confined)
-        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked))
-        .unwrap();
-    window.set_cursor_visible(false);
+    set_cursor_confinement(window, true);
 
     let (
         meshes,
@@ -449,19 +447,37 @@ fn main() {
     let mut right = false;
     let mut backward = false;
     let mut left = false;
+    let mut mouse_attached = true;
 
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent { event, .. } => match event {
             WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
             WindowEvent::Resized(_) => recreate_swapchain = true,
+            WindowEvent::MouseInput {state, button, ..} => {
+                let pressed = state == ElementState::Pressed;
+                let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
+                match button {
+                    MouseButton::Left => {
+                        set_cursor_confinement(window, true);
+                        mouse_attached = true;
+                    },
+                    _ => {}
+                }
+            }
             WindowEvent::KeyboardInput { input, .. } => {
                 let pressed = input.state == ElementState::Pressed;
+                let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
 
                 match input.virtual_keycode {
                     Some(VirtualKeyCode::W) => forward = pressed,
                     Some(VirtualKeyCode::A) => left = pressed,
                     Some(VirtualKeyCode::S) => backward = pressed,
                     Some(VirtualKeyCode::D) => right = pressed,
+                    Some(VirtualKeyCode::Q) => *control_flow = ControlFlow::Exit,
+                    Some(VirtualKeyCode::Escape) => {
+                        set_cursor_confinement(window, false);
+                        mouse_attached = false;
+                    },
                     _ => {}
                 }
             }
@@ -469,7 +485,9 @@ fn main() {
         }
         Event::DeviceEvent { event, .. } => match event {
             DeviceEvent::MouseMotion { delta } => {
-                camera.rotate(delta.0 as f32, delta.1 as f32);
+                if mouse_attached {
+                    camera.rotate(delta.0 as f32, delta.1 as f32);
+                }
             }
             _ => {}
         }
@@ -770,6 +788,21 @@ fn window_size_dependent_setup(
                 .unwrap()
         })
         .collect::<Vec<_>>()
+}
+
+fn set_cursor_confinement(
+    window: &Window,
+    state: bool
+) {
+    if state == true {
+        window.set_cursor_grab(CursorGrabMode::Confined)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked))
+            .unwrap();
+        window.set_cursor_visible(false);
+    } else {
+        window.set_cursor_grab(CursorGrabMode::None).unwrap();
+        window.set_cursor_visible(true);
+    }
 }
 
 mod vs {
