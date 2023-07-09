@@ -793,15 +793,15 @@ fn set_cursor_confinement(
     window: &Window,
     state: bool
 ) {
-    if state == true {
+    if state {
         window.set_cursor_grab(CursorGrabMode::Confined)
             .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked))
             .unwrap();
-        window.set_cursor_visible(false);
     } else {
         window.set_cursor_grab(CursorGrabMode::None).unwrap();
-        window.set_cursor_visible(true);
     }
+    // No cursor if mouse is confined
+    window.set_cursor_visible(!state);
 }
 
 mod vs {
