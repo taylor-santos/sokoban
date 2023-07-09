@@ -13,17 +13,19 @@ pub struct FirstPersonCamera {
     pub sensitivity: f32,
 }
 
-impl FirstPersonCamera {
-    pub fn new() -> FirstPersonCamera {
+impl Default for FirstPersonCamera {
+    fn default() -> Self {
         FirstPersonCamera {
-            position: Point3::new(0.0, 0.0, 0.0),
+            position: Point3::origin(),
             yaw: Rad(0.0),
             pitch: Rad(0.0),
             speed: 0.5,
             sensitivity: 0.1,
         }
     }
+}
 
+impl FirstPersonCamera {
     pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
         self.yaw = (self.yaw + Rad::from(Deg(delta_x * self.sensitivity))) % Rad::full_turn();
         let min = Rad::turn_div_4().neg();

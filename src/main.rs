@@ -56,7 +56,7 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
-use winit::event::{DeviceEvent, ElementState, VirtualKeyCode, MouseButton};
+use winit::event::{DeviceEvent, ElementState, MouseButton, VirtualKeyCode};
 use winit::window::CursorGrabMode;
 
 use camera::FirstPersonCamera;
@@ -403,8 +403,6 @@ fn main() {
     )
         .unwrap();
 
-    set_cursor_confinement(window, true);
-
     let (
         meshes,
         materials,
@@ -499,9 +497,11 @@ fn main() {
             .collect::<Vec<_>>()
     };
 
-    let mut camera = FirstPersonCamera::new();
-    camera.position = Point3::new(0.3, 0.05, 0.0);
-    camera.yaw = Rad(FRAC_PI_2);
+    let mut camera = FirstPersonCamera {
+        position: Point3::new(0.3, 0.05, 0.0),
+        yaw: Rad(FRAC_PI_2),
+        ..Default::default()
+    };
 
     let mut recreate_swapchain = false;
     let mut previous_frame_end = Some(Box::new(sync::now(device.clone())) as Box<dyn GpuFuture>);
@@ -510,7 +510,9 @@ fn main() {
     let mut right = false;
     let mut backward = false;
     let mut left = false;
-    let mut mouse_attached = true;
+
+    set_cursor_confinement(window, false);
+    let mut mouse_attached = false;
 
     let mut frame_times = Vec::<Duration>::new();
     let frame_report_frequency = 1000;
@@ -519,16 +521,10 @@ fn main() {
         Event::WindowEvent { event, .. } => match event {
             WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
             WindowEvent::Resized(_) => recreate_swapchain = true,
-            WindowEvent::MouseInput {state, button, ..} => {
-                let _pressed = state == ElementState::Pressed;
+            WindowEvent::MouseInput { button: MouseButton::Left, .. } if !mouse_attached => {
                 let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
-                match button {
-                    MouseButton::Left => {
-                        set_cursor_confinement(window, true);
-                        mouse_attached = true;
-                    },
-                    _ => {}
-                }
+                set_cursor_confinement(window, true);
+                mouse_attached = true;
             }
             WindowEvent::KeyboardInput { input, .. } => {
                 let pressed = input.state == ElementState::Pressed;
@@ -543,19 +539,19 @@ fn main() {
                     Some(VirtualKeyCode::Escape) => {
                         set_cursor_confinement(window, false);
                         mouse_attached = false;
-                    },
+                    }
                     _ => {}
                 }
             }
-            _ => {}
-        }
-        Event::DeviceEvent { event, .. } => match event {
-            DeviceEvent::MouseMotion { delta } => {
-                if mouse_attached {
-                    camera.rotate(delta.0 as f32, delta.1 as f32);
-                }
+            WindowEvent::Focused(false) if mouse_attached => {
+                let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
+                set_cursor_confinement(window, false);
+                mouse_attached = false;
             }
             _ => {}
+        }
+        Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta: (delta_x, delta_y) }, .. } if mouse_attached => {
+            camera.rotate(delta_x as f32, delta_y as f32);
         }
         Event::MainEventsCleared => {
             let now = Instant::now();
@@ -839,7 +835,7 @@ fn window_size_dependent_setup(
 
 fn set_cursor_confinement(
     window: &Window,
-    state: bool
+    state: bool,
 ) {
     if state {
         window.set_cursor_grab(CursorGrabMode::Confined)
