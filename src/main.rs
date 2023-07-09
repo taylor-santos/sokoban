@@ -9,7 +9,6 @@
 
 use std::{sync::Arc, time::Instant};
 use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
-use std::process;
 
 use cgmath::{Matrix4, Point3, Rad};
 use vulkano::{
