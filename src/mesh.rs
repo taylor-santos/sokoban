@@ -200,7 +200,6 @@ impl BufferBuilder {
                                 reader.read_indices()
                                     .expect("Unable to read indices from mesh")
                                     .into_u32()
-                                    .map(|i| i)
                             );
                             let index_count = self.indices.len() - index_offset;
 

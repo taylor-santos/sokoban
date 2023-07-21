@@ -509,16 +509,10 @@ fn main() {
         Event::WindowEvent { event, .. } => match event {
             WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
             WindowEvent::Resized(_) => recreate_swapchain = true,
-            WindowEvent::MouseInput { state, button, .. } => {
-                let _pressed = state == ElementState::Pressed;
+            WindowEvent::MouseInput { button: MouseButton::Left, .. } => {
                 let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
-                match button {
-                    MouseButton::Left => {
-                        set_cursor_confinement(window, true);
-                        mouse_attached = true;
-                    }
-                    _ => {}
-                }
+                set_cursor_confinement(window, true);
+                mouse_attached = true;
             }
             WindowEvent::KeyboardInput { input, .. } => {
                 let pressed = input.state == ElementState::Pressed;
@@ -539,20 +533,17 @@ fn main() {
             }
             _ => {}
         }
-        Event::DeviceEvent { event, .. } => match event {
-            DeviceEvent::MouseMotion { delta } => {
-                if mouse_attached {
-                    camera.rotate(delta.0 as f32, delta.1 as f32);
-                }
+        Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta }, .. } => {
+            if mouse_attached {
+                camera.rotate(delta.0 as f32, delta.1 as f32);
             }
-            _ => {}
         }
         Event::MainEventsCleared => {
             let now = Instant::now();
             let delta_time = now.duration_since(last_instant);
             last_instant = now;
 
-            frame_times.push(delta_time.clone());
+            frame_times.push(delta_time);
             if frame_times.len() >= frame_report_frequency {
                 let total_time: Duration = frame_times.iter().sum();
                 let frame_time = total_time / frame_times.len() as u32;
