@@ -1,48 +1,29 @@
-use std::io::Cursor;
-use std::time::Instant;
-
-use anyhow::{anyhow, Error};
 use cgmath::{Matrix4, SquareMatrix, Vector3, Vector4};
-use dataurl::DataUrl;
-use gltf::image::Source;
-use image::RgbaImage;
+use image::{DynamicImage, ImageBuffer};
 use vulkano::{
     buffer::{
-        Buffer,
+        self,
         BufferContents,
         BufferCreateInfo,
         BufferUsage,
         Subbuffer,
     },
+    image::ImageDimensions,
     memory::allocator::{
         AllocationCreateInfo,
         MemoryAllocator,
         MemoryUsage,
     },
 };
-use vulkano::image::ImageDimensions;
-
-use texture::load_texture;
-
-use crate::texture;
-
-pub struct Mesh {
-    pub vertices: Subbuffer<[f32]>,
-    pub normals: Option<Subbuffer<[f32]>>,
-    pub texcoords: Option<Subbuffer<[f32]>>,
-    pub indices: Subbuffer<[u32]>,
-    pub material: Option<usize>,
-}
 
 pub struct Texture {
-    pub data: RgbaImage,
+    pub data: Vec<u8>,
     pub dimensions: ImageDimensions,
 }
 
 type TextureID = usize;
 
 pub struct Material {
-    pub index: Option<usize>,
     pub name: Option<String>,
 
     pub base_color_factor: Vector4<f32>,
@@ -66,151 +47,182 @@ pub struct Material {
     pub double_sided: bool,
 }
 
-#[derive(Debug)]
+pub struct Buffer {
+    pub positions: Subbuffer<[f32]>,
+    pub normals: Subbuffer<[f32]>,
+    pub texcoords: Subbuffer<[f32]>,
+    pub indices: Subbuffer<[u32]>,
+    pub meshes: Vec<Vec<Primitive>>,
+    pub textures: Vec<Texture>,
+    pub materials: Vec<Material>,
+}
+
+pub struct Primitive {
+    pub index_offset: usize,
+    pub index_count: usize,
+    pub vert_offset: usize,
+    pub mat_idx: usize,
+}
+
+pub struct BufferBuilder {
+    positions: Vec<f32>,
+    normals: Vec<f32>,
+    texcoords: Vec<f32>,
+    indices: Vec<u32>,
+    meshes: Vec<Vec<Primitive>>,
+    textures: Vec<Texture>,
+    materials: Vec<Material>,
+}
+
 pub struct Object {
     pub transform: [[f32; 4]; 4],
     pub mesh_id: usize,
     pub name: String,
 }
 
-impl Mesh {
-    pub fn from_gltf(
+impl BufferBuilder {
+    pub fn new() -> Self {
+        BufferBuilder {
+            positions: Vec::new(),
+            normals: Vec::new(),
+            texcoords: Vec::new(),
+            indices: Vec::new(),
+            meshes: Vec::new(),
+            textures: Vec::new(),
+            materials: Vec::new(),
+        }
+    }
+
+    pub fn load_gltf(
+        mut self,
         path: &str,
-        memory_allocator: &impl MemoryAllocator,
-    ) -> Result<(Vec<Vec<Mesh>>, Vec<Material>, Vec<Texture>, Vec<Object>), Error> {
-        let loading_gltf_time = Instant::now();
-        let (gltf, buffers, _) = gltf::import(path).expect("Failed to read GLTF file");
-        println!("Loading GLTF model {}", path);
+        objects: &mut Vec<Object>,
+    ) -> BufferBuilder {
+        let (gltf, buffers, images) = gltf::import(path).expect("Failed to read GLTF file");
 
-        let textures = gltf.textures()
-            .enumerate()
-            .map(|(index, texture)| {
-                assert_eq!(texture.index(), index);
-                let img = texture.source();
-                let tex = match img.source() {
-                    Source::View { view, .. } => {
-                        let data_buf = &buffers[view.buffer().index()].0;
-                        let begin = view.offset();
-                        let end = begin + view.length();
-                        let bytes = &data_buf[begin..end];
-                        let cursor = Cursor::new(bytes);
-                        let (data, dimensions) = load_texture(cursor);
-                        Texture {
-                            data,
-                            dimensions,
-                        }
+        let tex_offset = self.textures.len();
+        let mat_offset = self.materials.len();
+        let mesh_offset = self.meshes.len();
+
+        self.textures.extend(
+            images.into_iter()
+                .map(|image| {
+                    let width = image.width;
+                    let height = image.height;
+                    let pixels = image.pixels;
+
+                    let data = match image.format {
+                        gltf::image::Format::R8 => DynamicImage::ImageLuma8(
+                            ImageBuffer::from_raw(width, height, pixels)
+                                .expect("Failed to load image data")),
+                        gltf::image::Format::R8G8 => DynamicImage::ImageLumaA8(
+                            ImageBuffer::from_raw(width, height, pixels)
+                                .expect("Failed to load image data")),
+                        gltf::image::Format::R8G8B8 => DynamicImage::ImageRgb8(
+                            ImageBuffer::from_raw(width, height, pixels)
+                                .expect("Failed to load image data")),
+                        gltf::image::Format::R8G8B8A8 => DynamicImage::ImageRgba8(
+                            ImageBuffer::from_raw(width, height, pixels)
+                                .expect("Failed to load image data")),
+                        _ => panic!("Unsupported image format: {:?}", image.format)
+                    }.to_rgba8().as_raw().to_owned();
+
+                    let dimensions = ImageDimensions::Dim2d {
+                        width,
+                        height,
+                        array_layers: 1,
+                    };
+
+                    Texture {
+                        data,
+                        dimensions,
                     }
-                    Source::Uri { uri, .. } => {
-                        let data_url = DataUrl::parse(uri).map_err(|_| anyhow!("Failed to parse texture data"))?;
-                        let bytes = data_url.get_data();
-                        let cursor = Cursor::new(bytes);
-                        let (data, dimensions) = load_texture(cursor);
-                        Texture {
-                            data,
-                            dimensions,
-                        }
+                })
+        );
+
+        self.materials.extend(
+            gltf.materials()
+                .map(|mat| {
+                    let pbr = mat.pbr_metallic_roughness();
+
+                    Material {
+                        name: mat.name().map(Into::into),
+
+                        base_color_factor: pbr.base_color_factor().into(),
+                        base_color_texture: pbr.base_color_texture().map(|tex| tex_offset + tex.texture().source().index()),
+                        metallic_factor: pbr.metallic_factor(),
+                        roughness_factor: pbr.roughness_factor(),
+                        metallic_roughness_texture: pbr.metallic_roughness_texture().map(|tex| tex_offset + tex.texture().source().index()),
+
+                        normal_texture: mat.normal_texture().map(|tex| tex_offset + tex.texture().source().index()),
+                        normal_scale: mat.normal_texture().map(|tex| tex.scale()),
+
+                        occlusion_texture: mat.occlusion_texture().map(|tex| tex_offset + tex.texture().source().index()),
+                        occlusion_strength: mat.occlusion_texture().map(|tex| tex.strength()),
+
+                        emissive_factor: mat.emissive_factor().into(),
+                        emissive_texture: mat.emissive_texture().map(|tex| tex_offset + tex.texture().source().index()),
+
+                        alpha_cutoff: mat.alpha_cutoff(),
+                        alpha_mode: mat.alpha_mode(),
+
+                        double_sided: mat.double_sided(),
                     }
-                };
-                Ok::<Texture, Error>(tex)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        println!("Loaded {} textures", textures.len());
+                })
+        );
 
-        let materials = gltf.materials()
-            .enumerate()
-            .map(|(index, mat)| {
-                assert!(mat.index().map_or(false, |i| i == index));
-                let pbr = mat.pbr_metallic_roughness();
-
-                Material {
-                    index: mat.index(),
-                    name: mat.name().map(Into::into),
-
-                    base_color_factor: pbr.base_color_factor().into(),
-                    base_color_texture: pbr.base_color_texture().map(|tex| tex.texture().index()),
-                    metallic_factor: pbr.metallic_factor(),
-                    roughness_factor: pbr.roughness_factor(),
-                    metallic_roughness_texture: pbr.metallic_roughness_texture().map(|tex| tex.texture().index()),
-
-                    normal_texture: mat.normal_texture().map(|tex| tex.texture().index()),
-                    normal_scale: mat.normal_texture().map(|tex| tex.scale()),
-
-                    occlusion_texture: mat.occlusion_texture().map(|tex| tex.texture().index()),
-                    occlusion_strength: mat.occlusion_texture().map(|tex| tex.strength()),
-
-                    emissive_factor: mat.emissive_factor().into(),
-                    emissive_texture: mat.emissive_texture().map(|tex| tex.texture().index()),
-
-                    alpha_cutoff: mat.alpha_cutoff(),
-                    alpha_mode: mat.alpha_mode(),
-
-                    double_sided: mat.double_sided(),
-                }
-            })
-            .collect::<Vec<_>>();
-        println!("Loaded {} materials", materials.len());
-
-        let meshes = gltf.meshes()
-            .enumerate()
-            .map(|(index, mesh)| {
-                assert_eq!(mesh.index(), index);
-                mesh.primitives()
-                    .map(|prim| {
-                        let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
-                        let verts = reader.read_positions()
-                            .ok_or(anyhow!("Unable to read positions from mesh"))?
-                            .flatten()
-                            .collect::<Vec<_>>();
-                        let tris = reader.read_indices()
-                            .ok_or(anyhow!("Unable to read indices from mesh"))?
-                            .into_u32()
-                            .collect::<Vec<_>>();
-                        let normals = reader.read_normals()
-                            .map(|normals| {
-                                normals
+        self.meshes.extend(
+            gltf.meshes()
+                .map(|mesh| mesh.primitives())
+                .map(|prims| {
+                    prims
+                        .map(|prim| {
+                            let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
+                            let vert_offset = self.positions.len() / 3;
+                            self.positions.extend(
+                                reader.read_positions()
+                                    .expect("Unable to read positions from mesh")
                                     .flatten()
-                                    .collect::<Vec<_>>()
-                            });
-                        let texcoords = reader.read_tex_coords(0)
-                            .map(|texcoords| {
-                                texcoords.into_f32()
+                            );
+                            self.normals.extend(
+                                reader.read_normals()
+                                    .expect("Unable to read normals from mesh")
                                     .flatten()
-                                    .collect::<Vec<_>>()
-                            });
-                        Ok::<_, Error>(Mesh {
-                            vertices: Self::make_buffer(verts.into_iter(), BufferUsage::VERTEX_BUFFER, memory_allocator),
-                            indices: Self::make_buffer(tris.into_iter(), BufferUsage::INDEX_BUFFER, memory_allocator),
-                            normals: normals.map(|normals| {
-                                Self::make_buffer(
-                                    normals.into_iter(),
-                                    BufferUsage::VERTEX_BUFFER,
-                                    memory_allocator,
-                                )
-                            }),
-                            texcoords: texcoords.map(|texcoords| {
-                                Self::make_buffer(
-                                    texcoords.into_iter(),
-                                    BufferUsage::VERTEX_BUFFER,
-                                    memory_allocator,
-                                )
-                            }),
-                            material: prim.material().index(),
+                            );
+                            self.texcoords.extend(
+                                reader.read_tex_coords(0)
+                                    .expect("Unable to read texcoords from mesh")
+                                    .into_f32()
+                                    .flatten()
+                            );
+                            let index_offset = self.indices.len();
+                            self.indices.extend(
+                                reader.read_indices()
+                                    .expect("Unable to read indices from mesh")
+                                    .into_u32()
+                            );
+                            let index_count = self.indices.len() - index_offset;
+
+                            Primitive {
+                                index_offset,
+                                index_count,
+                                vert_offset,
+                                mat_idx: prim.material().index().map(|i| i + mat_offset).unwrap(), // TODO: support models without materials
+                            }
                         })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        println!("Loaded {} primitives", meshes.iter().fold(0, |acc, v| acc + v.len()));
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<Vec<_>>>()
+        );
 
         let nodes = gltf.nodes()
             .enumerate()
             .map(|(index, node)| {
                 assert_eq!(node.index(), index);
-
                 (
                     node.name().unwrap_or("").to_string(),
                     Matrix4::from(node.transform().matrix()),
-                    node.mesh().map(|m| m.index()),
+                    node.mesh().map(|m| mesh_offset + m.index()),
                     node.children()
                         .map(|child| child.index())
                         .collect::<Vec<_>>(),
@@ -219,8 +231,7 @@ impl Mesh {
             .collect::<Vec<_>>();
         println!("Loaded {} nodes", nodes.len());
 
-        let objects = {
-            let mut objects = Vec::new();
+        {
             let mut stack = gltf.scenes()
                 .flat_map(|scene| {
                     scene.nodes()
@@ -247,12 +258,21 @@ impl Mesh {
                     stack.push((child_id, transform));
                 }
             }
-
-            objects
         };
-        println!("Loaded {} objects", objects.len());
-        dbg!(loading_gltf_time.elapsed());
-        Ok((meshes, materials, textures, objects))
+
+        self
+    }
+
+    pub fn build(self, memory_allocator: &impl MemoryAllocator) -> Buffer {
+        Buffer {
+            positions: Self::make_buffer(self.positions.into_iter(), BufferUsage::VERTEX_BUFFER, memory_allocator),
+            normals: Self::make_buffer(self.normals.into_iter(), BufferUsage::VERTEX_BUFFER, memory_allocator),
+            texcoords: Self::make_buffer(self.texcoords.into_iter(), BufferUsage::VERTEX_BUFFER, memory_allocator),
+            indices: Self::make_buffer(self.indices.into_iter(), BufferUsage::INDEX_BUFFER, memory_allocator),
+            meshes: self.meshes,
+            textures: self.textures,
+            materials: self.materials,
+        }
     }
 
     fn make_buffer<T, I>(
@@ -265,7 +285,7 @@ impl Mesh {
             I: IntoIterator<Item=T>,
             I::IntoIter: ExactSizeIterator,
     {
-        Buffer::from_iter(
+        buffer::Buffer::from_iter(
             memory_allocator,
             BufferCreateInfo {
                 usage,

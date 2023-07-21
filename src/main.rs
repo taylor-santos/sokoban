@@ -56,11 +56,10 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
-use winit::event::{DeviceEvent, ElementState, VirtualKeyCode, MouseButton};
+use winit::event::{DeviceEvent, ElementState, MouseButton, VirtualKeyCode};
 use winit::window::CursorGrabMode;
 
 use camera::FirstPersonCamera;
-use mesh::Mesh;
 
 mod mesh;
 mod texture;
@@ -392,38 +391,27 @@ fn main() {
         &mut viewport,
     );
 
-    let sampler = Sampler::new(
-        device.clone(),
-        SamplerCreateInfo {
-            mag_filter: Filter::Linear,
-            min_filter: Filter::Linear,
-            address_mode: [SamplerAddressMode::Repeat; 3],
-            ..Default::default()
-        },
-    )
-        .unwrap();
+    let (objects, meshes) = {
+        let mut objects = Vec::<mesh::Object>::new();
+        let meshes = mesh::BufferBuilder::new()
+            .load_gltf("models/sponza.glb", &mut objects)
+            .load_gltf("models/DamagedHelmet.glb", &mut objects)
+            .build(&memory_allocator);
 
-    set_cursor_confinement(window, true);
+        (objects, meshes)
+    };
 
-    let (
-        meshes,
-        materials,
-        textures,
-        objects,
-    ) = Mesh::from_gltf("models/sponza.gltf", &memory_allocator)
-        .unwrap();
-
-    let image_buffers = {
+    let texture_sets = {
         let mut builder = AutoCommandBufferBuilder::primary(
             &command_buffer_allocator,
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         ).unwrap();
         let image_buffer_time = Instant::now();
-        let images = textures.into_iter().map(|texture| {
+        let images = meshes.textures.into_iter().map(|texture| {
             let image = ImmutableImage::from_iter(
                 &memory_allocator,
-                texture.data.into_raw().into_iter(),
+                texture.data.into_iter(),
                 texture.dimensions,
                 MipmapsCount::One,
                 Format::R8G8B8A8_UNORM,
@@ -445,57 +433,57 @@ fn main() {
             .wait(None)
             .unwrap();
 
-        images
-    };
+        let sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                ..Default::default()
+            },
+        )
+            .unwrap();
 
-
-    let mesh_sets = {
         let texture_layout = pipeline.layout().set_layouts().get(1).unwrap();
-        let transform_layout = pipeline.layout().set_layouts().get(2).unwrap();
-        objects.into_iter().flat_map(|object| {
-            let transform = object.transform;
 
-            let object_subbuffer = {
-                let subbuffer = subbuffer_allocator.allocate_sized().unwrap();
-                let data = vs::Object {
-                    transform,
-                };
-                *subbuffer.write().unwrap() = data;
-                subbuffer
-            };
-
-            let transform_set = PersistentDescriptorSet::new(
-                &descriptor_set_allocator,
-                transform_layout.clone(),
-                [
-                    WriteDescriptorSet::buffer(0, object_subbuffer),
-                ],
-            ).expect("Failed to create descriptor set");
-
-            meshes[object.mesh_id].iter().map(|mesh| {
-                let mat_id = mesh.material.unwrap();
-                let tex_id = materials[mat_id].base_color_texture.unwrap();
-                let texture = &image_buffers[tex_id];
-
-                let vert_attribs = (
-                    mesh.vertices.clone(),
-                    mesh.normals.clone().unwrap(),
-                    mesh.texcoords.clone().unwrap(),
-                    mesh.indices.clone(),
-                );
-
-                let texture_set = PersistentDescriptorSet::new(
+        images.iter()
+            .map(|image| {
+                PersistentDescriptorSet::new(
                     &descriptor_set_allocator,
                     texture_layout.clone(),
                     [
-                        WriteDescriptorSet::image_view_sampler(0, texture.clone(), sampler.clone()),
+                        WriteDescriptorSet::image_view_sampler(0, image.clone(), sampler.clone()),
                     ],
-                ).expect("Failed to create descriptor set");
-
-                (transform_set.clone(), texture_set, vert_attribs)
+                ).expect("Failed to create descriptor set")
             })
-                .collect::<Vec<_>>()
-        })
+            .collect::<Vec<_>>()
+    };
+
+    let objects = {
+        let transform_layout = pipeline.layout().set_layouts().get(2).unwrap();
+        objects.into_iter()
+            .map(|object| {
+                let transform = object.transform;
+                let object_subbuffer = {
+                    let subbuffer = subbuffer_allocator.allocate_sized().unwrap();
+                    let data = vs::Object {
+                        transform,
+                    };
+                    *subbuffer.write().unwrap() = data;
+                    subbuffer
+                };
+
+                (
+                    object,
+                    PersistentDescriptorSet::new(
+                        &descriptor_set_allocator,
+                        transform_layout.clone(),
+                        [
+                            WriteDescriptorSet::buffer(0, object_subbuffer),
+                        ],
+                    ).expect("Failed to create descriptor set")
+                )
+            })
             .collect::<Vec<_>>()
     };
 
@@ -510,25 +498,21 @@ fn main() {
     let mut right = false;
     let mut backward = false;
     let mut left = false;
-    let mut mouse_attached = true;
 
     let mut frame_times = Vec::<Duration>::new();
     let frame_report_frequency = 1000;
+
+    set_cursor_confinement(window, false);
+    let mut mouse_attached = false;
 
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent { event, .. } => match event {
             WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
             WindowEvent::Resized(_) => recreate_swapchain = true,
-            WindowEvent::MouseInput {state, button, ..} => {
-                let _pressed = state == ElementState::Pressed;
+            WindowEvent::MouseInput { button: MouseButton::Left, .. } => {
                 let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
-                match button {
-                    MouseButton::Left => {
-                        set_cursor_confinement(window, true);
-                        mouse_attached = true;
-                    },
-                    _ => {}
-                }
+                set_cursor_confinement(window, true);
+                mouse_attached = true;
             }
             WindowEvent::KeyboardInput { input, .. } => {
                 let pressed = input.state == ElementState::Pressed;
@@ -543,26 +527,23 @@ fn main() {
                     Some(VirtualKeyCode::Escape) => {
                         set_cursor_confinement(window, false);
                         mouse_attached = false;
-                    },
+                    }
                     _ => {}
                 }
             }
             _ => {}
         }
-        Event::DeviceEvent { event, .. } => match event {
-            DeviceEvent::MouseMotion { delta } => {
-                if mouse_attached {
-                    camera.rotate(delta.0 as f32, delta.1 as f32);
-                }
+        Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta }, .. } => {
+            if mouse_attached {
+                camera.rotate(delta.0 as f32, delta.1 as f32);
             }
-            _ => {}
         }
         Event::MainEventsCleared => {
             let now = Instant::now();
             let delta_time = now.duration_since(last_instant);
             last_instant = now;
 
-            frame_times.push(delta_time.clone());
+            frame_times.push(delta_time);
             if frame_times.len() >= frame_report_frequency {
                 let total_time: Duration = frame_times.iter().sum();
                 let frame_time = total_time / frame_times.len() as u32;
@@ -662,13 +643,21 @@ fn main() {
             )
                 .unwrap();
 
+            builder
+                .bind_vertex_buffers(0, (
+                    meshes.positions.clone(),
+                    meshes.normals.clone(),
+                    meshes.texcoords.clone(),
+                ))
+                .bind_index_buffer(meshes.indices.clone());
+
             let clear_values = vec![Some([0.0, 0.68, 1.0, 1.0].into()), Some(1.0.into())];
 
             let uniform_subbuffer = {
                 let proj = {
                     let aspect_ratio = swapchain.image_extent()[0] as f32
                         / swapchain.image_extent()[1] as f32;
-                    let near = 0.02;
+                    let near = 0.005;
                     let far = 10000.0;
 
                     let proj = cgmath::perspective(
@@ -740,24 +729,29 @@ fn main() {
                 .set_viewport(0, [viewport.clone()])
                 .bind_pipeline_graphics(pipeline.clone());
 
-            for (transform_set, texture_set, vert_attribs) in &mesh_sets {
-                let (vertices, normals, texcoords, indices) = vert_attribs.clone();
-                let index_count = indices.len();
-                builder
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        pipeline.layout().clone(),
-                        0,
-                        (camera_set.clone(), texture_set.clone(), transform_set.clone()),
-                    )
-                    .bind_vertex_buffers(0, (
-                        vertices,
-                        normals,
-                        texcoords,
-                    ))
-                    .bind_index_buffer(indices)
-                    .draw_indexed(index_count as u32, 1, 0, 0, 0)
-                    .unwrap();
+            for (object, transform_set) in &objects {
+                let primitives = &meshes.meshes[object.mesh_id];
+                for prim in primitives {
+                    let mat = &meshes.materials[prim.mat_idx];
+                    let tex_idx = mat.base_color_texture.unwrap();
+                    let texture_set = texture_sets[tex_idx].clone();
+
+                    builder
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            pipeline.layout().clone(),
+                            0,
+                            (camera_set.clone(), texture_set.clone(), transform_set.clone()),
+                        )
+                        .draw_indexed(
+                            prim.index_count as u32,
+                            1,
+                            prim.index_offset as u32,
+                            prim.vert_offset as i32,
+                            0,
+                        )
+                        .unwrap();
+                }
             }
 
             builder
@@ -839,7 +833,7 @@ fn window_size_dependent_setup(
 
 fn set_cursor_confinement(
     window: &Window,
-    state: bool
+    state: bool,
 ) {
     if state {
         window.set_cursor_grab(CursorGrabMode::Confined)

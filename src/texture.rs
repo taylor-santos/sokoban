@@ -7,6 +7,7 @@ use image::{
 };
 use vulkano::image::ImageDimensions;
 
+#[allow(dead_code)]
 pub fn load_texture<R: Read + BufRead + Seek>(
     cursor: R
 ) -> (RgbaImage, ImageDimensions) {
