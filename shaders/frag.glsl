@@ -1,9 +1,8 @@
 #version 450
 
-layout(location = 0) in vec3 v_normal;
-layout(location = 1) in vec2 v_texcoord;
-layout(location = 2) in vec3 v_view_dir;
-layout(location = 3) in vec3 v_world_normal;
+layout(location = 0) in vec2 v_texcoord;
+layout(location = 1) in vec3 v_view_dir;
+layout(location = 2) in vec3 v_world_normal;
 
 layout(location = 0) out vec4 f_color;
 
@@ -18,7 +17,6 @@ float random(vec2 st) {
 }
 
 void main() {
-    // float brightness = dot(normalize(v_normal), normalize(LIGHT));
     vec2 uv = vec2(v_texcoord.x, v_texcoord.y);
     vec4 albedo = texture(tex, uv);
     if (albedo.a < 1.0) {
