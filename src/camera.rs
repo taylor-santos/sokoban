@@ -19,7 +19,7 @@ impl FirstPersonCamera {
             position: Point3::new(0.0, 0.0, 0.0),
             yaw: Rad(0.0),
             pitch: Rad(0.0),
-            speed: 0.5,
+            speed: 5.0,
             sensitivity: 0.1,
         }
     }

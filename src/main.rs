@@ -11,15 +11,15 @@ use std::{sync::Arc, time::Instant};
 use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
 use std::time::Duration;
 
-use cgmath::{Matrix4, Point3, Rad};
+use cgmath::{Deg, Euler, Matrix4, One, Point3, Rad, Vector3};
 use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
-        BufferContents, BufferUsage,
+        Buffer, BufferContents, BufferCreateInfo, BufferUsage,
     },
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
-        RenderPassBeginInfo, SubpassContents,
+        PrimaryCommandBufferAbstract, RenderPassBeginInfo, SubpassContents,
     },
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, PersistentDescriptorSet, WriteDescriptorSet,
@@ -28,7 +28,7 @@ use vulkano::{
     format::Format,
     image::{AttachmentImage, ImageAccess, ImageUsage, ImmutableImage, MipmapsCount, SwapchainImage, view::ImageView},
     instance::{Instance, InstanceCreateInfo},
-    memory::allocator::StandardMemoryAllocator,
+    memory::allocator::{AllocationCreateInfo, MemoryUsage, StandardMemoryAllocator},
     pipeline::{
         graphics::{
             depth_stencil::DepthStencilState,
@@ -42,24 +42,21 @@ use vulkano::{
     render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
     sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
     swapchain::{
-        acquire_next_image, AcquireError, Swapchain, SwapchainCreateInfo, SwapchainCreationError,
-        SwapchainPresentInfo,
+        acquire_next_image, AcquireError, PresentMode, Swapchain, SwapchainCreateInfo,
+        SwapchainCreationError, SwapchainPresentInfo,
     },
     sync::{self, FlushError, GpuFuture},
     VulkanLibrary,
 };
-use vulkano::command_buffer::PrimaryCommandBufferAbstract;
-use vulkano::swapchain::PresentMode;
 use vulkano_win::VkSurfaceBuild;
 use winit::{
-    event::{Event, WindowEvent},
+    event::{DeviceEvent, ElementState, Event, MouseButton, VirtualKeyCode, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    window::{Window, WindowBuilder},
+    window::{CursorGrabMode, Window, WindowBuilder},
 };
-use winit::event::{DeviceEvent, ElementState, MouseButton, VirtualKeyCode};
-use winit::window::CursorGrabMode;
 
 use camera::FirstPersonCamera;
+use crate::mesh::Object;
 
 mod mesh;
 mod texture;
@@ -86,6 +83,21 @@ pub struct Texcoord {
     texcoord: [f32; 2],
 }
 
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+pub struct InstanceData {
+    #[format(R32G32B32A32_SFLOAT)]
+    pub transform_instance: [[f32; 4]; 4],
+}
+
+// An object bundled with a descriptor set for its transformation
+type ObjectSet = (Object, Arc<PersistentDescriptorSet>);
+
+struct InstanceObjects {
+    objects: Vec<ObjectSet>,
+    offset: u32,
+    count: u32,
+}
 
 fn main() {
     // The first step of any Vulkan program is to create an instance.
@@ -349,7 +361,7 @@ fn main() {
             depth: {
                 load: Clear,
                 store: DontCare,
-                format: Format::D16_UNORM,
+                format: Format::D32_SFLOAT,
                 samples: 1,
             },
         },
@@ -365,7 +377,8 @@ fn main() {
         .vertex_input_state([
             Position::per_vertex(),
             Normal::per_vertex(),
-            Texcoord::per_vertex()
+            Texcoord::per_vertex(),
+            InstanceData::per_instance(),
         ])
         .vertex_shader(vs.entry_point("main").unwrap(), ())
         .input_assembly_state(InputAssemblyState::new())
@@ -391,14 +404,105 @@ fn main() {
         &mut viewport,
     );
 
-    let (objects, meshes) = {
-        let mut objects = Vec::<mesh::Object>::new();
-        let meshes = mesh::BufferBuilder::new()
-            .load_gltf("models/sponza.glb", &mut objects)
-            .load_gltf("models/DamagedHelmet.glb", &mut objects)
-            .build(&memory_allocator);
+    let (instances, instance_buffer, meshes) = {
+        let mut builder = mesh::BufferBuilder::new();
 
-        (objects, meshes)
+        let mut instances = Vec::<InstanceObjects>::new();
+        let mut instance_data = Vec::<InstanceData>::new();
+
+        // Helper function to store a set of objects' instances in the above vectors
+        let mut add_instances = |is: Vec<InstanceData>, objects: Vec<ObjectSet>| {
+            instances.push(InstanceObjects {
+                objects,
+                offset: instance_data.len() as u32,
+                count: is.len() as u32,
+            });
+            let mut is = is;
+            instance_data.append(&mut is);
+        };
+
+        // Helper function to build a descriptor set for an object's transform
+        let create_object_descriptor_set = |object: Object| -> ObjectSet {
+            let transform = object.transform;
+            let object_subbuffer = {
+                let subbuffer = subbuffer_allocator.allocate_sized().unwrap();
+                let data = vs::Object {
+                    transform,
+                };
+                *subbuffer.write().unwrap() = data;
+                subbuffer
+            };
+            let transform_layout = pipeline.layout().set_layouts().get(2).unwrap();
+            let set = PersistentDescriptorSet::new(
+                &descriptor_set_allocator,
+                transform_layout.clone(),
+                [
+                    WriteDescriptorSet::buffer(0, object_subbuffer),
+                ],
+            ).expect("Failed to create descriptor set");
+
+            (object, set)
+        };
+
+        {
+            let mut sponza_objects = Vec::<Object>::new();
+            builder = builder.load_gltf("models/sponza.glb", &mut sponza_objects);
+            let sponza_objects = sponza_objects.into_iter()
+                .map(create_object_descriptor_set)
+                .collect::<Vec<_>>();
+
+            // For this model, create one instance with just the identity matrix applied
+            let sponza_instances = vec!(InstanceData {
+                transform_instance: Matrix4::one().into(),
+            });
+
+            add_instances(sponza_instances, sponza_objects);
+        }
+        {
+            let mut helmet_objects = Vec::<Object>::new();
+            builder = builder.load_gltf("models/DamagedHelmet.glb", &mut helmet_objects);
+            let helmet_objects = helmet_objects.into_iter()
+                .map(create_object_descriptor_set)
+                .collect::<Vec<_>>();
+
+            // For this model, create a 10x10x10 grid of instances with a different rotation applied to each
+            let mut helmet_instances = Vec::<InstanceData>::new();
+            for (x,y,z) in itertools::iproduct!(-5..5, 0..10, -5..5) {
+                helmet_instances.push(InstanceData {
+                    transform_instance: (
+                        Matrix4::from_translation(Vector3::new(x as f32, y as f32, z as f32)) *
+                            Matrix4::from_scale(0.1) *
+                            Matrix4::from(Euler::new(
+                                Deg(x as f32) * 100.0,
+                                Deg(y as f32) * 100.0,
+                                Deg(z as f32) * 100.0,
+                            ))
+                    ).into(),
+                });
+            }
+
+            add_instances(helmet_instances, helmet_objects);
+        }
+
+        let meshes = builder.build(&memory_allocator);
+
+        let instance_buffer = {
+            Buffer::from_iter(
+                &memory_allocator,
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    usage: MemoryUsage::Upload,
+                    ..Default::default()
+                },
+                instance_data,
+            )
+                .unwrap()
+        };
+
+        (instances, instance_buffer, meshes)
     };
 
     let texture_sets = {
@@ -459,36 +563,8 @@ fn main() {
             .collect::<Vec<_>>()
     };
 
-    let objects = {
-        let transform_layout = pipeline.layout().set_layouts().get(2).unwrap();
-        objects.into_iter()
-            .map(|object| {
-                let transform = object.transform;
-                let object_subbuffer = {
-                    let subbuffer = subbuffer_allocator.allocate_sized().unwrap();
-                    let data = vs::Object {
-                        transform,
-                    };
-                    *subbuffer.write().unwrap() = data;
-                    subbuffer
-                };
-
-                (
-                    object,
-                    PersistentDescriptorSet::new(
-                        &descriptor_set_allocator,
-                        transform_layout.clone(),
-                        [
-                            WriteDescriptorSet::buffer(0, object_subbuffer),
-                        ],
-                    ).expect("Failed to create descriptor set")
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-
     let mut camera = FirstPersonCamera::new();
-    camera.position = Point3::new(0.3, 0.05, 0.0);
+    camera.position = Point3::new(6.0, 1.5, -0.5);
     camera.yaw = Rad(FRAC_PI_2);
 
     let mut recreate_swapchain = false;
@@ -648,6 +724,7 @@ fn main() {
                     meshes.positions.clone(),
                     meshes.normals.clone(),
                     meshes.texcoords.clone(),
+                    instance_buffer.clone(),
                 ))
                 .bind_index_buffer(meshes.indices.clone());
 
@@ -681,13 +758,10 @@ fn main() {
                 };
                 let view = camera.get_view_matrix();
 
-                let scale = Matrix4::from_scale(0.05);
-
-
                 let uniform_data = vs::Data {
-                    world: (scale).into(),
                     view: view.into(),
                     proj: proj.into(),
+                    camera_pos: camera.position.into(),
                 };
 
                 let subbuffer = subbuffer_allocator.allocate_sized().unwrap();
@@ -729,28 +803,30 @@ fn main() {
                 .set_viewport(0, [viewport.clone()])
                 .bind_pipeline_graphics(pipeline.clone());
 
-            for (object, transform_set) in &objects {
-                let primitives = &meshes.meshes[object.mesh_id];
-                for prim in primitives {
-                    let mat = &meshes.materials[prim.mat_idx];
-                    let tex_idx = mat.base_color_texture.unwrap();
-                    let texture_set = texture_sets[tex_idx].clone();
+            for instance in &instances {
+                for (object, transform_set) in &instance.objects {
+                    let primitives = &meshes.meshes[object.mesh_id];
+                    for prim in primitives {
+                        let mat = &meshes.materials[prim.mat_idx];
+                        let tex_idx = mat.base_color_texture.unwrap();
+                        let texture_set = texture_sets[tex_idx].clone();
 
-                    builder
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Graphics,
-                            pipeline.layout().clone(),
-                            0,
-                            (camera_set.clone(), texture_set.clone(), transform_set.clone()),
-                        )
-                        .draw_indexed(
-                            prim.index_count as u32,
-                            1,
-                            prim.index_offset as u32,
-                            prim.vert_offset as i32,
-                            0,
-                        )
-                        .unwrap();
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Graphics,
+                                pipeline.layout().clone(),
+                                0,
+                                (camera_set.clone(), texture_set.clone(), transform_set.clone()),
+                            )
+                            .draw_indexed(
+                                prim.index_count as u32,
+                                instance.count,
+                                prim.index_offset as u32,
+                                prim.vert_offset as i32,
+                                instance.offset,
+                            )
+                            .unwrap();
+                    }
                 }
             }
 
@@ -811,7 +887,7 @@ fn window_size_dependent_setup(
     let dimensions = images[0].dimensions().width_height();
     viewport.dimensions = [dimensions[0] as f32, dimensions[1] as f32];
     let depth_buffer = ImageView::new_default(
-        AttachmentImage::transient(allocator, dimensions, Format::D16_UNORM).unwrap(),
+        AttachmentImage::transient(allocator, dimensions, Format::D32_SFLOAT).unwrap(),
     )
         .unwrap();
 
